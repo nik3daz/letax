@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FiscalLab — On-Device French Tax Document Workbench</title>
+  <link rel="stylesheet" href="./styles.css" />
+
+  <!-- PDF.js (Mozilla) for native PDF text + bounding boxes & canvas rendering -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+
+  <!-- Tesseract.js v5 (WASM OCR for scanned French tax documents & images) -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+  <!-- SheetJS (xlsx) for exporting client spreadsheets to .xlsx / .csv -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+  <!-- jsPDF for generating realistic French Tax sample PDFs on-device -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+  <!-- Processing / OCR Progress Banner -->
+  <div id="processing-banner" class="hidden" style="position:fixed; top:62px; left:50%; transform:translateX(-50%); z-index:200; background:#1d4ed8; color:#fff; padding:8px 18px; border-radius:999px; box-shadow:0 8px 25px rgba(0,0,0,0.5); font-weight:600; display:flex; align-items:center; gap:10px;">
+    <span>⏳</span>
+    <span id="processing-banner-text">Processing...</span>
+  </div>
+
+  <!-- Top Bar: Client Project Selector, Triage Summary Pills, Settings & Export -->
+  <header class="topbar">
+    <div style="display:flex; align-items:center; gap:14px;">
+      <div class="brand">
+        <span>🇫🇷 FiscalLab</span>
+        <span class="brand-badge">100% ON-DEVICE</span>
+      </div>
+
+      <!-- Per-Client Project Selector -->
+      <div class="project-selector-bar">
+        <label for="project-select">Client Project:</label>
+        <select id="project-select" class="select-input"></select>
+        <button id="new-project-btn" class="btn btn-primary btn-sm" title="Create a new client project and upload files">+ New Project</button>
+        <button id="add-files-btn" class="btn btn-sm" title="Add PDFs or images to the active project">📥 Add Files</button>
+        <input type="file" id="quick-file-input" multiple accept=".pdf,image/png,image/jpeg,image/webp" class="hidden" />
+        <button id="delete-project-btn" class="btn btn-sm btn-danger" title="Delete this client project">🗑️</button>
+      </div>
+    </div>
+
+    <!-- Live Triage Stats Pills (Standard vs Review vs Non-Standard) -->
+    <div id="triage-pills" class="triage-summary-pills"></div>
+
+    <!-- Right Actions: Rules, Settings (Regex Baseline vs Local LLM) -->
+    <div class="topbar-actions">
+      <button id="open-rule-modal-btn" class="btn" title="Create or manage custom extraction rules">📐 Extraction Rules</button>
+      <button id="open-settings-btn" class="btn" title="Configure engine (Regex Baseline vs Local WebGPU LLM)">
+        <span id="llm-mode-indicator">⚙️ Mode: Regex Baseline</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Workspace -->
+  <main class="workspace-container">
+    <div class="upper-workbench">
+      <!-- 1. Left Sidebar: Client Document Queue & Triage Filter -->
+      <aside class="sidebar-queue">
+        <div class="sidebar-header">
+          <div class="sidebar-title-row">
+            <span class="sidebar-title">Document Triage Queue</span>
+          </div>
+          <div class="filter-tabs">
+            <button class="filter-tab active" data-filter="all">All</button>
+            <button class="filter-tab" data-filter="standard" title="Recognized standard documents">🟢 Std</button>
+            <button class="filter-tab" data-filter="needs_review" title="Documents needing review">🟡 Review</button>
+            <button class="filter-tab" data-filter="non_standard" title="Non-standard documents">🟣 Non-Std</button>
+          </div>
+        </div>
+        <div id="doc-queue-list" class="doc-list"></div>
+      </aside>
+
+      <!-- 2. Center Pane: Original Document Viewer with Interactive Bounding Boxes -->
+      <section class="viewer-pane">
+        <div class="viewer-toolbar">
+          <div class="viewer-toolbar-group">
+            <button id="prev-page-btn" class="btn btn-sm">◀</button>
+            <span id="page-indicator" style="font-size:12px; font-weight:600; min-width:80px; text-align:center;">Page 1 / 1</span>
+            <button id="next-page-btn" class="btn btn-sm">▶</button>
+            <span style="color:var(--border-subtle); margin:0 4px;">|</span>
+            <button id="zoom-out-btn" class="btn btn-sm">−</button>
+            <span id="zoom-indicator" style="font-size:11.5px; min-width:44px; text-align:center;">115%</span>
+            <button id="zoom-in-btn" class="btn btn-sm">+</button>
+          </div>
+
+          <div class="viewer-toolbar-group">
+            <label for="overlay-mode-select" style="font-size:11.5px; color:var(--text-secondary);">Interactive Boxes:</label>
+            <select id="overlay-mode-select" class="select-input" style="min-width:175px; padding:3px 8px; font-size:11.5px;">
+              <option value="highlights">Amounts, Tax Codes & Mapped</option>
+              <option value="mapped">Mapped Fields Only</option>
+              <option value="all">All Detected Text</option>
+              <option value="none">Hide Overlays</option>
+            </select>
+            <button id="viewer-force-ocr-btn" class="btn btn-sm" title="Force French OCR (Tesseract.js) on this document">🔍 Force OCR</button>
+          </div>
+        </div>
+
+        <div class="viewer-canvas-scroll">
+          <div id="viewer-empty-state" class="empty-state hidden">
+            <h3>No Document Selected</h3>
+            <p>Upload PDF files or scanned images into the client project to view the original document side-by-side with its extracted data.</p>
+          </div>
+
+          <div id="viewer-stage-wrapper">
+            <div id="page-stage" class="page-stage">
+              <canvas id="doc-render-canvas"></canvas>
+              <div id="bbox-overlay" class="bbox-overlay"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. Right Pane: Extracted Data & Verification Inspector -->
+      <aside class="inspector-pane">
+        <div class="inspector-classification-bar">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-secondary); font-weight:700;">
+              Classification & Verification
+            </span>
+            <span style="font-size:11px; color:var(--text-muted);">Tip: Click any highlighted box on the PDF to tag it</span>
+          </div>
+          <div class="classification-grid">
+            <select id="inspector-doctype-select" class="select-input" title="Tax Document Type"></select>
+            <select id="inspector-triage-select" class="select-input" title="Standardization Triage Status">
+              <option value="standard">🟢 Standard</option>
+              <option value="needs_review">🟡 Needs Review</option>
+              <option value="non_standard">🟣 Non-Standard</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="inspector-tabs">
+          <button class="inspector-tab active" data-tab="fields">✓ Extracted Fields</button>
+          <button class="inspector-tab" data-tab="entities">🔢 Numbers & Codes</button>
+          <button class="inspector-tab" data-tab="raw">📄 Raw Text / OCR</button>
+        </div>
+
+        <div id="inspector-body" class="inspector-body"></div>
+      </aside>
+    </div>
+
+    <!-- Bottom Drawer: Live Client Spreadsheet Preview & Export -->
+    <section id="spreadsheet-drawer" class="spreadsheet-drawer">
+      <div class="drawer-header">
+        <div style="display:flex; align-items:center; gap:10px;">
+          <button id="toggle-drawer-btn" class="btn btn-sm">▼ Client Spreadsheet</button>
+          <span style="font-weight:700; font-size:12.5px;">Live Spreadsheet Preview (click any cell to locate on the original PDF)</span>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <label for="spreadsheet-mode-select" style="font-size:11.5px; color:var(--text-secondary);">View:</label>
+          <select id="spreadsheet-mode-select" class="select-input" style="min-width:225px; padding:3px 8px; font-size:11.5px;">
+            <option value="by_doc">1 Row per Document (Detailed)</option>
+            <option value="consolidated">Consolidated Client Tax Summary</option>
+          </select>
+          <button id="export-csv-btn" class="btn btn-sm">⬇️ Export CSV</button>
+          <button id="export-xlsx-btn" class="btn btn-sm btn-emerald">📊 Export Excel (.xlsx)</button>
+        </div>
+      </div>
+      <div class="drawer-table-container">
+        <table class="data-table">
+          <thead id="spreadsheet-thead"></thead>
+          <tbody id="spreadsheet-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <!-- MODAL 1: New Client Project Dialog -->
+  <div id="new-project-modal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span>📁 New Client Project</span>
+        <button id="close-new-project-modal" class="btn btn-sm">✕</button>
+      </div>
+      <div class="modal-body">
+        <div>
+          <label style="font-size:12px; font-weight:600; color:var(--text-secondary);">Client / Project Name *</label>
+          <input type="text" id="new-project-name" class="text-input" placeholder="e.g. Jean & Marie Dupont — 2026 Tax Return" style="margin-top:4px;" />
+        </div>
+        <div style="display:grid; grid-template-columns: 140px 1fr; gap:10px;">
+          <div>
+            <label style="font-size:12px; font-weight:600; color:var(--text-secondary);">Income Tax Year</label>
+            <input type="text" id="new-project-year" class="text-input" value="2025" style="margin-top:4px;" />
+          </div>
+          <div>
+            <label style="font-size:12px; font-weight:600; color:var(--text-secondary);">Project Notes (optional)</label>
+            <input type="text" id="new-project-notes" class="text-input" placeholder="e.g. Salaries + Bank IFU + Rental Property" style="margin-top:4px;" />
+          </div>
+        </div>
+
+        <div>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+            <label style="font-size:12px; font-weight:600; color:var(--text-secondary);">Upload All Client Files (PDFs, Scanned PNG/JPGs)</label>
+            <button id="load-sample-batch-btn" class="btn btn-sm btn-emerald" type="button">✨ Load 4 Sample French Tax Docs</button>
+          </div>
+          <div id="new-project-dropzone" class="dropzone">
+            <div style="font-size:22px; margin-bottom:6px;">📄 📥</div>
+            <div style="font-weight:600; margin-bottom:4px;">Drag & drop PDF files or scanned images here</div>
+            <div style="font-size:11.5px; color:var(--text-muted);">or click to browse your computer (100% local in-browser processing)</div>
+            <input type="file" id="new-project-files" multiple accept=".pdf,image/png,image/jpeg,image/webp" class="hidden" />
+          </div>
+          <div id="new-project-file-list" style="margin-top:8px; font-size:11.5px; color:var(--text-secondary);"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="create-project-submit-btn" class="btn btn-primary">Create Project & Process Files</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 2: Custom Extraction Rule Builder -->
+  <div id="rule-modal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span>📐 Custom Extraction Rules</span>
+        <button id="close-rule-modal" class="btn btn-sm">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size:12px; color:var(--text-secondary);">
+          When you discover a recurring non-standard document, add an <strong>anchor keyword/phrase</strong>: the engine will automatically extract the first currency amount (€) following that text across your documents.
+        </p>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+          <div>
+            <label style="font-size:11.5px; color:var(--text-secondary);">Spreadsheet Column Name *</label>
+            <input type="text" id="rule-column-input" class="text-input" placeholder="e.g. Rental_Repair_Expenses" style="margin-top:4px;" />
+          </div>
+          <div>
+            <label style="font-size:11.5px; color:var(--text-secondary);">Display Label (English)</label>
+            <input type="text" id="rule-label-input" class="text-input" placeholder="e.g. Deductible Property Repairs" style="margin-top:4px;" />
+          </div>
+        </div>
+        <div>
+          <label style="font-size:11.5px; color:var(--text-secondary);">French Text / Keyword Preceding the Number on the PDF *</label>
+          <input type="text" id="rule-anchor-input" class="text-input" placeholder="e.g. Total charges travaux fonciers" style="margin-top:4px;" />
+        </div>
+        <div style="display:flex; justify-content:flex-end;">
+          <button id="save-custom-rule-btn" class="btn btn-primary btn-sm">+ Add Rule & Re-Analyze</button>
+        </div>
+
+        <hr style="border:none; border-top:1px solid var(--border-subtle);" />
+        <div>
+          <div style="font-weight:600; font-size:12px; margin-bottom:6px;">Active Custom Rules:</div>
+          <div id="custom-rules-list" style="display:flex; flex-direction:column; gap:6px;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 3: Settings (Regex Baseline vs Optional Local WebLLM) -->
+  <div id="settings-modal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span>⚙️ Engine Settings (Regex Baseline & Local LLM)</span>
+        <button id="close-settings-modal" class="btn btn-sm">✕</button>
+      </div>
+      <div class="modal-body">
+        <div style="background:var(--bg-app); padding:12px; border-radius:8px; border:1px solid var(--border-subtle);">
+          <div style="font-weight:700; color:#34d399; margin-bottom:4px;">✓ Baseline Engine Active: PDF.js + French OCR + Tax Regex</div>
+          <div style="font-size:11.5px; color:var(--text-secondary);">
+            Extracts native PDF text layers instantaneously, runs Tesseract.js (French language pack) only on scanned pages/images, and detects 30+ Cerfa tax box codes (1AJ, 1BJ, 2DC, 6DE, 7DB, RFR, etc.) and euro amounts with minimal CPU/RAM usage.
+          </div>
+        </div>
+
+        <div style="background:var(--bg-app); padding:12px; border-radius:8px; border:1px solid rgba(168,85,247,0.4); display:flex; flex-direction:column; gap:10px;">
+          <label style="display:flex; align-items:center; gap:8px; font-weight:700; color:#c084fc; cursor:pointer;">
+            <input type="checkbox" id="setting-use-llm" />
+            Enable Local In-Browser LLM (WebLLM / WebGPU)
+          </label>
+          <p style="font-size:11.5px; color:var(--text-secondary);">
+            Runs a quantized instruction-tuned LLM 100% locally on your GPU (zero external API calls) to classify and extract key-value fields from <strong>Non-Standard</strong> documents.
+          </p>
+
+          <div>
+            <label style="font-size:11.5px; color:var(--text-secondary);">Local Model (Cached in browser IndexedDB after first download):</label>
+            <select id="setting-llm-model" class="select-input" style="width:100%; margin-top:4px;"></select>
+          </div>
+
+          <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer;">
+            <input type="checkbox" id="setting-auto-llm" />
+            Automatically run Local LLM when a document is triaged as "Non-Standard"
+          </label>
+
+          <div id="webgpu-status-box" style="font-size:11.5px; padding:8px; background:#151f32; border-radius:6px; border:1px solid var(--border-subtle);">
+            Checking WebGPU status...
+          </div>
+
+          <div style="display:flex; justify-content:flex-end;">
+            <button id="preload-llm-btn" class="btn btn-sm btn-purple" type="button">⬇️ Preload LLM into GPU Memory</button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="save-settings-btn" class="btn btn-primary">Save Settings</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./src/app.js"></script>
+</body>
+</html>
